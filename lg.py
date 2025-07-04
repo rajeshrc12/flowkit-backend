@@ -55,7 +55,7 @@ def chat_node(message, chat_history, initial_state):
     initial_state["output"] = message
 
 
-def agent(nodes, edges, initial_state):
+def agent(node, nodes, edges, initial_state):
     initial_state["tool_result"] = []
     initial_state["model_result"] = []
     nearest_node_ids = []
@@ -103,7 +103,7 @@ def execute_workflow(execution_nodes, nodes, edges, message, chat_history):
             chat_node(message, chat_history, initial_state)
 
         if node["name"] == "agent":
-            agent(nodes, edges, initial_state)
+            agent(node, nodes, edges, initial_state)
 
         if node["name"] == "format_node":
             format_node(initial_state)
