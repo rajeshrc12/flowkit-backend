@@ -1,15 +1,15 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from workflow import get_workflow
+from workflow import get_workflow, get_credential
 from pydantic import BaseModel
-from google import genai
 from dotenv import load_dotenv
-from gemini import retrieve_from_pinecone
+from google_config import get_worksheet_data
 import json
-load_dotenv()
+import requests
+from deepdiff import DeepDiff
+import re
 
-client = genai.Client()
-chat = client.chats.create(model="gemini-2.5-flash")
+load_dotenv()
 
 app = FastAPI()
 
@@ -22,140 +22,86 @@ app.add_middleware(
 )
 
 
-def get_ordered_nodes(nodes, edges, start_node):
-    # Build adjacency list
-    graph = {node: [] for node in nodes}
-    for edge in edges:
-        graph[edge["source"]].append(edge["target"])
-
-    visited = set()
-    ordered_nodes = []
-
-    def dfs(node):
-        if node not in visited:
-            visited.add(node)
-            ordered_nodes.append(node)
-            for neighbor in graph.get(node, []):
-                dfs(neighbor)
-
-    dfs(start_node)
-    return ordered_nodes
+def replace_keys_in_json(match, replacements):
+    json_str = match.group(0)
+    obj = json.loads(json_str)
+    for k, v in replacements.items():
+        if k in obj:
+            obj[k] = v
+    return json.dumps(obj)
 
 
-def get_node_by_id(id, nodes):
-    return next((node for node in nodes if node["id"] == id), None)
+def google_sheets(node, response):
+    credential = get_credential(node["data"]["account"])
+
+    data = get_worksheet_data(node, credential)
+
+    diff = DeepDiff(node["data"]["response"], data, ignore_order=True)
+
+    # If no diff at all, return False
+    if not diff:
+        return False
+
+    # Extract only newly added items (e.g., new rows)
+    added_items = diff.get('iterable_item_added', {})
+    new_objects = list(added_items.values())
+
+    return new_objects
 
 
-def get_edge_by_source_id(id, edges):
-    return next((edge for edge in edges if edge["source"] == id), None)
+def extract_value(match):
+    obj = json.loads(match.group(0))
+    # Return the only value in the JSON object
+    return next(iter(obj.values()))
 
 
-def get_edge_by_target_id(id, edges):
-    return next((edge for edge in edges if edge["target"] == id), None)
+def slack(node, response):
+    credential = get_credential(node["data"]["account"])
+    print(credential)
+    message_strings = []
+    message_template = node["data"]["messageText"]
 
+    for row in response:
+        new_msg = re.sub(
+            r'\{[^{}]+\}', lambda m: replace_keys_in_json(m, row), message_template)
 
-def get_start_node(nodes):
-    return next((node for node in nodes if node["is_start"] == True), None)
+        result = re.sub(r'\{[^{}]+\}', extract_value, new_msg)
 
+        message_strings.append(result)
 
-def get_execution_nodes(start_node, nodes, edges):
-    root_node_ids = []
-    for node in nodes:
-        if node["type"] == "root":
-            root_node_ids.append(node["id"])
+    print("message_strings", message_strings)
+    # setup
+    # replace with the user id
+    user_id = credential['data']['authed_user']["id"]
+    access_token = credential['data']['access_token']
+    message = "\n".join(message_strings)
 
-    root_node_edges = []
-    for edge in edges:
-        if edge["source"] in root_node_ids and edge["target"] in root_node_ids:
-            root_node_edges.append(edge)
+    # Step 1: Open a DM channel with the user
+    open_dm_url = "https://slack.com/api/conversations.open"
+    open_dm_headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+    open_dm_payload = {
+        "users": user_id
+    }
+    open_dm_response = requests.post(
+        open_dm_url, headers=open_dm_headers, json=open_dm_payload)
 
-    execution_nodes = get_ordered_nodes(
-        root_node_ids, root_node_edges, start_node["id"])
-    return execution_nodes
+    channel_id = open_dm_response.json()['channel']['id']
 
-
-def chat_node(message, chat_message, initial_state):
-    initial_state["chat_message"] = chat_message
-    initial_state["output"] = message
-
-
-def agent(agent_node, nodes, edges, initial_state):
-    tool_result = []
-    model_result = []
-    nearest_node_ids = []
-    tool_nodes = []
-    model_nodes = []
-
-    for edge in edges:
-        if agent_node["id"] == edge["source"]:
-            nearest_node_ids.append(edge["target"])
-
-    for id in nearest_node_ids:
-        node = get_node_by_id(id, nodes)
-        if node["type"] == "tool":
-            tool_nodes.append(node)
-        if node["type"] == "model":
-            model_nodes.append(node)
-
-    for tool in tool_nodes:
-        embedding_node_id = get_edge_by_source_id(
-            tool["id"], edges)["target"]
-        embedding_node = get_node_by_id(embedding_node_id, nodes)
-        if tool["name"] == "pinecone":
-            results = retrieve_from_pinecone(initial_state["output"])
-            for i, doc in enumerate(results, 1):
-                tool_result.append(doc.page_content)
-
-    model_node = model_nodes[0]
-
-    if model_node["name"] == "gemini":
-        chat = client.chats.create(
-            model="gemini-2.5-flash",
-            history=[
-                genai.types.Content(
-                    role=item["role"],
-                    parts=[genai.types.Part(text=part)
-                           for part in item["parts"]]
-                )
-                for item in initial_state["chat_message"]
-            ]
-        )
-        prompt = initial_state["output"]
-        if tool_result:
-            prompt = f"""
-            You need to answer user query based on give data, just return answer no headline or title.
-            User query : 
-            {initial_state["output"]}
-            Data:
-            {" ".join(tool_result)}
-
-            """
-        initial_state["chat_message"].append(
-            {"role": "user", "parts": [initial_state["output"]]})
-        response = chat.send_message(prompt)
-        initial_state["chat_message"].append(
-            {"role": "model", "parts": [response.text]})
-        initial_state["output"] = response.text
-
-
-def format_node(initial_state):
-    initial_state["output"] = "***"+initial_state["output"]+"***"
-
-
-def execute_workflow(execution_nodes, nodes, edges, message, chat_message):
-    initial_state = {}
-    for id in execution_nodes:
-        node = get_node_by_id(id, nodes)
-
-        if node["name"] == "chat_node":
-            chat_node(message, chat_message, initial_state)
-
-        if node["name"] == "agent":
-            agent(node, nodes, edges, initial_state)
-
-        if node["name"] == "format_node":
-            format_node(initial_state)
-    return initial_state
+    # Step 2: Send a message to that channel
+    send_msg_url = "https://slack.com/api/chat.postMessage"
+    send_msg_headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+    send_msg_payload = {
+        "channel": channel_id,
+        "text": message
+    }
+    send_msg_response = requests.post(
+        send_msg_url, headers=send_msg_headers, json=send_msg_payload)
 
 
 @app.get("/")
@@ -172,29 +118,16 @@ class ChatRequest(BaseModel):
 @app.post("/chat")
 def run_chat(request: ChatRequest):
     workflow = get_workflow(request.workflow_id)
+    response = []
     # print(json.dumps(workflow, indent=4))
-    workflow_nodes = []
-    workflow_edges = []
     for node in workflow["node"]:
-        if "credentialId" in node["data"]:
-            print(node["data"]["name"], node["data"]["credentialId"])
-        workflow_nodes.append({
-            "id": node["id"],
-            "name": node["data"]["name"],
-            "is_start": node["data"]["isStart"],
-            "type": node["data"]["type"]
-        })
-    for edge in workflow["edge"]:
-        workflow_edges.append({
-            "source": edge["source"],
-            "target": edge["target"],
-        })
-    start_node = get_start_node(workflow_nodes)
-    execution_nodes = get_execution_nodes(
-        start_node, workflow_nodes, workflow_edges)
-    print(execution_nodes)
-    result = execute_workflow(execution_nodes, workflow_nodes,
-                              workflow_edges, request.message, request.chat_message)
+        if (node["type"] == "google_sheets"):
+            result = google_sheets(node, response)
+            if not result:
+                break
+            response += result
 
-    # print(result)
-    return {"chat_message": result["chat_message"]}
+        if (node["type"] == "slack"):
+            slack(node, response)
+
+    return workflow
